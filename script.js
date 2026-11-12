@@ -29,6 +29,7 @@ let handLandmarker = null;
 let animationId = null;
 let lastVideoTime = -1;
 let lastHandCount = -1;
+let smoothedHands = [];
 
 function setStatus(message) {
   statusEl.textContent = message;
@@ -46,6 +47,52 @@ function friendlyError(error) {
     default:
       return "Could not start the camera. Please try again.";
   }
+}
+
+// ---------- Smoothing ----------
+
+// Moves each point a little toward its new position so the dots don't shake.
+// Still hands get strong smoothing, fast hands get almost none.
+// Hands are matched to the previous frame by wrist position and sorted
+// left to right, so hand 1 and hand 2 keep a stable order.
+function smoothHands(rawHands) {
+  const previous = smoothedHands;
+  const used = new Set();
+
+  const next = rawHands.map((hand) => {
+    let best = -1;
+    let bestDistance = 0.3;
+
+    previous.forEach((prev, i) => {
+      if (used.has(i)) return;
+      const d = Math.hypot(hand[0].x - prev[0].x, hand[0].y - prev[0].y);
+      if (d < bestDistance) {
+        bestDistance = d;
+        best = i;
+      }
+    });
+
+    if (best === -1) {
+      return hand.map((p) => ({ x: p.x, y: p.y, z: p.z }));
+    }
+
+    used.add(best);
+    const prev = previous[best];
+
+    return hand.map((p, i) => {
+      const speed = Math.hypot(p.x - prev[i].x, p.y - prev[i].y);
+      const alpha = Math.min(1, 0.3 + speed * 15);
+      return {
+        x: prev[i].x + (p.x - prev[i].x) * alpha,
+        y: prev[i].y + (p.y - prev[i].y) * alpha,
+        z: p.z,
+      };
+    });
+  });
+
+  next.sort((a, b) => a[0].x - b[0].x);
+  smoothedHands = next;
+  return next;
 }
 
 // ---------- Canvas drawing ----------
@@ -144,16 +191,18 @@ function trackLoop() {
     lastVideoTime = video.currentTime;
     const result = handLandmarker.detectForVideo(video, performance.now());
 
-    // Debug helper for the Console. We remove it in a later commit.
-    window.latestHands = result.landmarks;
+    const hands = smoothHands(result.landmarks);
 
-    const count = result.landmarks.length;
+    // Debug helper for the Console. We remove it in a later commit.
+    window.latestHands = hands;
+
+    const count = hands.length;
     if (count !== lastHandCount) {
       lastHandCount = count;
       console.log("Hands found:", count);
     }
 
-    drawFingertips(result.landmarks);
+    drawFingertips(hands);
   }
 
   animationId = requestAnimationFrame(trackLoop);
@@ -163,6 +212,7 @@ function startTracking() {
   if (animationId !== null || !stream || !handLandmarker) return;
   lastVideoTime = -1;
   lastHandCount = -1;
+  smoothedHands = [];
   animationId = requestAnimationFrame(trackLoop);
 }
 
@@ -171,6 +221,7 @@ function stopTracking() {
     cancelAnimationFrame(animationId);
     animationId = null;
   }
+  smoothedHands = [];
   window.latestHands = [];
   clearCanvas();
 }
