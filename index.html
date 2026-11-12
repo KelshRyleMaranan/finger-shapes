@@ -8,39 +8,40 @@
     name="description"
     content="Hand-tracking webcam toy. Connect your fingers to make shapes: color inside, gray outside."
   />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link
-    href="https://fonts.googleapis.com/css2?family=Archivo:wght@900&family=Poppins:wght@400;500;600&display=swap"
-    rel="stylesheet"
-  />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <main class="page">
-    <header class="hero">
-      <p class="eyebrow">Hand tracking · Webcam</p>
-      <h1>Finger Shapes</h1>
-      <p class="lead">
-        Hold up both hands. Connect your fingers to draw a shape: color
-        inside, gray everywhere else.
-      </p>
-    </header>
-
-    <section class="card stage" id="stage">
-      <div class="stage-placeholder" id="placeholder">
-        <p>Your camera will appear here.</p>
-      </div>
+  <main class="app">
+    <section class="stage" id="stage">
+      <video id="video" autoplay playsinline muted hidden></video>
+      <p class="stage-message" id="status">Camera is off</p>
     </section>
 
-    <div class="actions">
-      <button id="startBtn" class="btn" type="button" disabled>
-        Start camera
+    <aside class="rail">
+      <button
+        id="startBtn"
+        class="shutter"
+        type="button"
+        title="Start camera"
+        aria-label="Start camera"
+        disabled
+      >
+        <svg
+          width="28"
+          height="28"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M4 8h3l1.5-2h7L17 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z" />
+          <circle cx="12" cy="13" r="3.5" />
+        </svg>
       </button>
-      <p class="hint" id="status">The camera comes in the next step.</p>
-    </div>
-
-    <p class="privacy">Your video stays in your browser. Nothing is uploaded.</p>
+    </aside>
   </main>
 
   <script src="script.js"></script>

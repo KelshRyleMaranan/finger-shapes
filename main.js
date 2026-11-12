@@ -1,5 +1,7 @@
-const { app, BrowserWindow } = require("electron");
+const { app, BrowserWindow, nativeTheme } = require("electron");
 const path = require("path");
+
+nativeTheme.themeSource = "dark";
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -8,6 +10,7 @@ function createWindow() {
     minWidth: 420,
     minHeight: 600,
     title: "Finger Shapes",
+    backgroundColor: "#202020",
     autoHideMenuBar: true,
   });
 
