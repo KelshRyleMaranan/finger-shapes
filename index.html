@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Finger Shapes</title>
+  <meta
+    name="description"
+    content="Hand-tracking webcam toy. Connect your fingers to make shapes: color inside, gray outside."
+  />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Archivo:wght@900&family=Poppins:wght@400;500;600&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <p class="eyebrow">Hand tracking · Webcam</p>
+      <h1>Finger Shapes</h1>
+      <p class="lead">
+        Hold up both hands. Connect your fingers to draw a shape: color
+        inside, gray everywhere else.
+      </p>
+    </header>
+
+    <section class="card stage" id="stage">
+      <div class="stage-placeholder" id="placeholder">
+        <p>Your camera will appear here.</p>
+      </div>
+    </section>
+
+    <div class="actions">
+      <button id="startBtn" class="btn" type="button" disabled>
+        Start camera
+      </button>
+      <p class="hint" id="status">The camera comes in the next step.</p>
+    </div>
+
+    <p class="privacy">Your video stays in your browser. Nothing is uploaded.</p>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>
