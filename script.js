@@ -8,9 +8,21 @@ const WASM_URL =
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
+// MediaPipe point numbers for the five fingertips:
+// thumb, index, middle, ring, pinky.
+const FINGERTIPS = [4, 8, 12, 16, 20];
+
+const stage = document.getElementById("stage");
 const video = document.getElementById("video");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
 const startBtn = document.getElementById("startBtn");
 const statusEl = document.getElementById("status");
+
+const accent =
+  getComputedStyle(document.documentElement)
+    .getPropertyValue("--accent")
+    .trim() || "#e8892f";
 
 let stream = null;
 let handLandmarker = null;
@@ -35,6 +47,67 @@ function friendlyError(error) {
       return "Could not start the camera. Please try again.";
   }
 }
+
+// ---------- Canvas drawing ----------
+
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(stage.clientWidth * dpr);
+  canvas.height = Math.round(stage.clientHeight * dpr);
+}
+
+// The video fills the window with object-fit: cover, which crops it.
+// This works out where the video sits so dots land on the real fingertips.
+function getCoverTransform() {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const scale = Math.max(canvas.width / vw, canvas.height / vh);
+  return {
+    vw,
+    vh,
+    scale,
+    offsetX: (canvas.width - vw * scale) / 2,
+    offsetY: (canvas.height - vh * scale) / 2,
+  };
+}
+
+function toCanvas(point, t) {
+  return {
+    x: t.offsetX + point.x * t.vw * t.scale,
+    y: t.offsetY + point.y * t.vh * t.scale,
+  };
+}
+
+function clearCanvas() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+function drawFingertips(hands) {
+  clearCanvas();
+  if (!video.videoWidth) return;
+
+  const t = getCoverTransform();
+  const dpr = window.devicePixelRatio || 1;
+
+  ctx.fillStyle = accent;
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 2 * dpr;
+
+  for (const hand of hands) {
+    for (const index of FINGERTIPS) {
+      const p = toCanvas(hand[index], t);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 7 * dpr, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+}
+
+new ResizeObserver(resizeCanvas).observe(stage);
+resizeCanvas();
+
+// ---------- Hand tracker ----------
 
 async function createHandLandmarker(vision, delegate) {
   return HandLandmarker.createFromOptions(vision, {
@@ -79,6 +152,8 @@ function trackLoop() {
       lastHandCount = count;
       console.log("Hands found:", count);
     }
+
+    drawFingertips(result.landmarks);
   }
 
   animationId = requestAnimationFrame(trackLoop);
@@ -97,7 +172,10 @@ function stopTracking() {
     animationId = null;
   }
   window.latestHands = [];
+  clearCanvas();
 }
+
+// ---------- Camera ----------
 
 function stopCamera() {
   stopTracking();
@@ -107,6 +185,7 @@ function stopCamera() {
   }
   video.srcObject = null;
   video.hidden = true;
+  canvas.hidden = true;
   startBtn.title = "Start camera";
   startBtn.setAttribute("aria-label", "Start camera");
   setStatus("Camera is off");
@@ -130,6 +209,7 @@ async function startCamera() {
     await video.play();
 
     video.hidden = false;
+    canvas.hidden = false;
     statusEl.hidden = true;
     startBtn.title = "Stop camera";
     startBtn.setAttribute("aria-label", "Stop camera");
