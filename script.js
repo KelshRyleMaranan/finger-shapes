@@ -8,9 +8,9 @@ const WASM_URL =
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
-// MediaPipe point numbers for the five fingertips:
-// thumb, index, middle, ring, pinky.
-const FINGERTIPS = [4, 8, 12, 16, 20];
+// MediaPipe point numbers for the fingertips that make the shape:
+// 4 = thumb, 8 = index. Add 12 (middle), 16 (ring), 20 (pinky) for more corners.
+const SHAPE_FINGERTIPS = [4, 8];
 
 const stage = document.getElementById("stage");
 const video = document.getElementById("video");
@@ -129,20 +129,64 @@ function clearCanvas() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 }
 
-function drawFingertips(hands) {
+// Sorts points by angle around their center so the outline never twists.
+function orderAroundCenter(points) {
+  const cx = points.reduce((sum, p) => sum + p.x, 0) / points.length;
+  const cy = points.reduce((sum, p) => sum + p.y, 0) / points.length;
+  return points
+    .slice()
+    .sort((a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx));
+}
+
+function traceShape(shape) {
+  ctx.beginPath();
+  ctx.moveTo(shape[0].x, shape[0].y);
+  for (let i = 1; i < shape.length; i++) {
+    ctx.lineTo(shape[i].x, shape[i].y);
+  }
+  ctx.closePath();
+}
+
+function drawOverlay(hands) {
   clearCanvas();
+  window.latestShape = [];
   if (!video.videoWidth) return;
 
   const t = getCoverTransform();
   const dpr = window.devicePixelRatio || 1;
 
+  // Chosen fingertip positions on the canvas, one list per hand.
+  const points = hands.map((hand) =>
+    SHAPE_FINGERTIPS.map((index) => toCanvas(hand[index], t))
+  );
+
+  if (points.length === 2) {
+    const shape = orderAroundCenter(points.flat());
+    window.latestShape = shape;
+
+    // Normal color inside the shape: draw the plain video clipped to it.
+    // The video behind the canvas is gray, so everything outside stays gray.
+    ctx.save();
+    traceShape(shape);
+    ctx.clip();
+    ctx.drawImage(video, t.offsetX, t.offsetY, t.vw * t.scale, t.vh * t.scale);
+    ctx.restore();
+
+    // Outline.
+    traceShape(shape);
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 3 * dpr;
+    ctx.lineJoin = "round";
+    ctx.stroke();
+  }
+
+  // Dots go last so they sit on top.
   ctx.fillStyle = accent;
   ctx.strokeStyle = "#ffffff";
   ctx.lineWidth = 2 * dpr;
 
-  for (const hand of hands) {
-    for (const index of FINGERTIPS) {
-      const p = toCanvas(hand[index], t);
+  for (const handPoints of points) {
+    for (const p of handPoints) {
       ctx.beginPath();
       ctx.arc(p.x, p.y, 7 * dpr, 0, Math.PI * 2);
       ctx.fill();
@@ -202,7 +246,7 @@ function trackLoop() {
       console.log("Hands found:", count);
     }
 
-    drawFingertips(hands);
+    drawOverlay(hands);
   }
 
   animationId = requestAnimationFrame(trackLoop);
@@ -223,6 +267,7 @@ function stopTracking() {
   }
   smoothedHands = [];
   window.latestHands = [];
+  window.latestShape = [];
   clearCanvas();
 }
 
