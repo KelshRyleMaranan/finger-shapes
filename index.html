@@ -16,6 +16,7 @@
       <video id="video" autoplay playsinline muted hidden></video>
       <canvas id="overlay" hidden></canvas>
       <p class="stage-message" id="status">Camera is off</p>
+      <p class="toast" id="toast" aria-live="polite"></p>
     </section>
 
     <aside class="rail">
@@ -42,6 +43,58 @@
           <circle cx="12" cy="13" r="3.5" />
         </svg>
       </button>
+
+      <button
+        id="swapBtn"
+        class="tool"
+        type="button"
+        title="Swap colors"
+        aria-label="Swap colors"
+        aria-pressed="false"
+      >
+        <svg
+          width="22"
+          height="22"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          aria-hidden="true"
+        >
+          <circle cx="12" cy="12" r="8.5" />
+          <path d="M12 3.5a8.5 8.5 0 0 1 0 17z" fill="currentColor" stroke="none" />
+        </svg>
+      </button>
+
+      <button
+        id="filterBtn"
+        class="tool"
+        type="button"
+        title="Filter: NONE"
+        aria-label="Filter: NONE. Click to change."
+      >
+        <svg
+          width="22"
+          height="22"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M12 4.5l2 5.5 5.5 2-5.5 2-2 5.5-2-5.5-5.5-2 5.5-2z" />
+        </svg>
+      </button>
+
+      <label class="tool swatch" title="Dot and line color">
+        <input
+          id="colorInput"
+          type="color"
+          value="#ffd21f"
+          aria-label="Dot and line color"
+        />
+      </label>
     </aside>
   </main>
 

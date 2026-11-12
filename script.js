@@ -8,6 +8,14 @@ const WASM_URL =
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
+// How easily the tracker accepts a hand (0 to 1). Lower = catches more hands
+// but may rarely see a "hand" that isn't one. The default is 0.5.
+const TRACKING_SENSITIVITY = 0.3;
+
+// If a hand disappears for a moment, keep its last position for this many
+// frames (about 0.2 seconds) so the shape doesn't flicker.
+const HOLD_FRAMES = 6;
+
 // The fingers we can detect. tip / joint / base are MediaPipe point numbers.
 // A finger counts as "out" when its tip is far from the base compared with
 // its middle joint. "on" and "off" are two different limits, so a finger
@@ -24,17 +32,43 @@ const FINGERS = [
 // from ever counting, for example remove "ring" and "pinky" for fewer corners.
 const SHAPE_FINGERS = ["thumb", "index", "middle", "ring", "pinky"];
 
+// Camcorder yellow. The person can change it with the color circle.
+const DEFAULT_COLOR = "#ffd21f";
+
+// How long each bracket arm can be, in screen pixels.
+const BRACKET_ARM = 26;
+
+// Filters that can be applied inside the shape.
+const FILTERS = [
+  { id: "none", name: "NONE" },
+  { id: "pixelate", name: "PIXELATE" },
+  { id: "blur", name: "BLUR" },
+  { id: "glitch", name: "GLITCH" },
+];
+
+// Filters work on a smaller copy of the video (this wide, in pixels)
+// so a big shape doesn't slow the app down.
+const FILTER_WORK_WIDTH = 480;
+
+const COLOR_KEY = "fingerShapes.color";
+const SWAP_KEY = "fingerShapes.swap";
+const FILTER_KEY = "fingerShapes.filter";
+
 const stage = document.getElementById("stage");
 const video = document.getElementById("video");
 const canvas = document.getElementById("overlay");
 const ctx = canvas.getContext("2d");
 const startBtn = document.getElementById("startBtn");
+const swapBtn = document.getElementById("swapBtn");
+const filterBtn = document.getElementById("filterBtn");
+const colorInput = document.getElementById("colorInput");
 const statusEl = document.getElementById("status");
+const toastEl = document.getElementById("toast");
 
-const accent =
-  getComputedStyle(document.documentElement)
-    .getPropertyValue("--accent")
-    .trim() || "#e8892f";
+let markColor = DEFAULT_COLOR;
+let swapped = false;
+let filterIndex = 0;
+let toastTimer = null;
 
 let stream = null;
 let handLandmarker = null;
@@ -43,10 +77,35 @@ let lastVideoTime = -1;
 let lastHandCount = -1;
 let smoothedHands = [];
 let fingerStates = [];
+let fpsFrames = 0;
+let fpsStart = 0;
+
+// A tiny tile of faint dark lines, repeated to make a scanline texture.
+const scanlineTile = document.createElement("canvas");
+scanlineTile.width = 1;
+scanlineTile.height = 4;
+const tileCtx = scanlineTile.getContext("2d");
+tileCtx.fillStyle = "rgba(0, 0, 0, 0.14)";
+tileCtx.fillRect(0, 0, 1, 1);
+const scanlinePattern = ctx.createPattern(scanlineTile, "repeat");
+
+// Small hidden canvases used by the filters.
+const workCanvas = document.createElement("canvas");
+const workCtx = workCanvas.getContext("2d", { willReadFrequently: true });
+const tinyCanvas = document.createElement("canvas");
+const tinyCtx = tinyCanvas.getContext("2d");
+tinyCtx.imageSmoothingQuality = "high";
 
 function setStatus(message) {
   statusEl.textContent = message;
   statusEl.hidden = false;
+}
+
+function showToast(message) {
+  toastEl.textContent = message;
+  toastEl.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove("show"), 1600);
 }
 
 function friendlyError(error) {
@@ -62,12 +121,52 @@ function friendlyError(error) {
   }
 }
 
+// ---------- Settings (remembered on this laptop) ----------
+
+function loadSetting(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch (error) {
+    return null;
+  }
+}
+
+function saveSetting(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (error) {
+    // Not saving is fine, the app still works.
+  }
+}
+
+function applyColor(color) {
+  markColor = color;
+  colorInput.value = color;
+  document.documentElement.style.setProperty("--mark", color);
+}
+
+function applySwap(on) {
+  swapped = on;
+  stage.classList.toggle("swapped", on);
+  swapBtn.setAttribute("aria-pressed", String(on));
+}
+
+function applyFilter(index, announce) {
+  filterIndex = ((index % FILTERS.length) + FILTERS.length) % FILTERS.length;
+  const filter = FILTERS[filterIndex];
+  filterBtn.title = `Filter: ${filter.name}`;
+  filterBtn.setAttribute("aria-label", `Filter: ${filter.name}. Click to change.`);
+  filterBtn.dataset.active = String(filter.id !== "none");
+  if (announce) showToast(`FILTER: ${filter.name}`);
+}
+
 // ---------- Smoothing ----------
 
 // Moves each point a little toward its new position so the dots don't shake.
 // Still hands get strong smoothing, fast hands get almost none.
 // Hands are matched to the previous frame by wrist position and sorted
 // left to right, so hand 1 and hand 2 keep a stable order.
+// A hand that goes missing is kept for a few frames before it is dropped.
 function smoothHands(rawHands) {
   const previous = smoothedHands;
   const used = new Set();
@@ -101,6 +200,17 @@ function smoothHands(rawHands) {
         z: p.z,
       };
     });
+  });
+
+  // Keep hands that went missing for a short moment.
+  previous.forEach((prev, i) => {
+    if (used.has(i)) return;
+    const missed = (prev.missed || 0) + 1;
+    if (missed <= HOLD_FRAMES) {
+      const kept = prev.map((p) => ({ x: p.x, y: p.y, z: p.z }));
+      kept.missed = missed;
+      next.push(kept);
+    }
   });
 
   next.sort((a, b) => a[0].x - b[0].x);
@@ -147,6 +257,130 @@ function updateFingerStates(hands) {
   );
 }
 
+// ---------- Filters ----------
+
+// Pixelate: shrink the picture, then blow it back up without smoothing.
+function pixelate(w, h) {
+  const block = Math.max(6, Math.round(w / 36));
+  const tw = Math.max(1, Math.round(w / block));
+  const th = Math.max(1, Math.round(h / block));
+  tinyCanvas.width = tw;
+  tinyCanvas.height = th;
+  tinyCtx.imageSmoothingQuality = "high";
+  tinyCtx.drawImage(workCanvas, 0, 0, tw, th);
+
+  workCtx.save();
+  workCtx.imageSmoothingEnabled = false;
+  workCtx.clearRect(0, 0, w, h);
+  workCtx.drawImage(tinyCanvas, 0, 0, tw, th, 0, 0, w, h);
+  workCtx.restore();
+}
+
+// Glitch: random horizontal bands slide sideways, and the red and blue
+// channels are pushed apart. The bands change every few frames.
+let glitchBands = [];
+let glitchTick = 0;
+
+function makeGlitchBands(w, h) {
+  const count = 3 + Math.floor(Math.random() * 3);
+  glitchBands = Array.from({ length: count }, () => {
+    const bandHeight = Math.max(2, Math.round(h * (0.02 + Math.random() * 0.08)));
+    return {
+      y: Math.floor(Math.random() * Math.max(1, h - bandHeight)),
+      h: bandHeight,
+      shift: Math.round((Math.random() - 0.5) * w * 0.25),
+    };
+  });
+}
+
+function glitch(w, h) {
+  const image = workCtx.getImageData(0, 0, w, h);
+  const src = image.data;
+  const out = new Uint8ClampedArray(src);
+  const split = Math.max(2, Math.round(w / 90));
+
+  // Push red to the right and blue to the left.
+  for (let y = 0; y < h; y++) {
+    const rowStart = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = (rowStart + x) * 4;
+      const xr = Math.min(w - 1, x + split);
+      const xb = Math.max(0, x - split);
+      out[i] = src[(rowStart + xr) * 4];
+      out[i + 2] = src[(rowStart + xb) * 4 + 2];
+    }
+  }
+
+  // Slide a few bands sideways.
+  if (glitchTick % 3 === 0 || glitchBands.length === 0) makeGlitchBands(w, h);
+  glitchTick++;
+
+  for (const band of glitchBands) {
+    for (let y = band.y; y < band.y + band.h && y < h; y++) {
+      const rowStart = y * w * 4;
+      const row = out.slice(rowStart, rowStart + w * 4);
+      for (let x = 0; x < w; x++) {
+        const from = Math.min(w - 1, Math.max(0, x - band.shift)) * 4;
+        const to = rowStart + x * 4;
+        out[to] = row[from];
+        out[to + 1] = row[from + 1];
+        out[to + 2] = row[from + 2];
+        out[to + 3] = row[from + 3];
+      }
+    }
+  }
+
+  workCtx.putImageData(new ImageData(out, w, h), 0, 0);
+}
+
+function shapeBounds(shape) {
+  const xs = shape.map((p) => p.x);
+  const ys = shape.map((p) => p.y);
+  const x0 = Math.max(0, Math.floor(Math.min(...xs)));
+  const y0 = Math.max(0, Math.floor(Math.min(...ys)));
+  const x1 = Math.min(canvas.width, Math.ceil(Math.max(...xs)));
+  const y1 = Math.min(canvas.height, Math.ceil(Math.max(...ys)));
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+}
+
+// Draws the filtered video for the area around the shape.
+// The caller has already clipped the canvas to the shape.
+function drawFilteredVideo(filterId, shape, t) {
+  const box = shapeBounds(shape);
+  if (box.w < 2 || box.h < 2) return;
+
+  const k = Math.min(1, FILTER_WORK_WIDTH / box.w);
+  const w = Math.max(1, Math.round(box.w * k));
+  const h = Math.max(1, Math.round(box.h * k));
+  workCanvas.width = w;
+  workCanvas.height = h;
+
+  // Draw the video onto the small canvas, lined up with the shape's box.
+  const parts = [];
+  if (swapped) parts.push("grayscale(1) contrast(1.25)");
+  if (filterId === "blur") parts.push(`blur(${Math.max(2, Math.round(w / 70))}px)`);
+
+  workCtx.save();
+  workCtx.filter = parts.length ? parts.join(" ") : "none";
+  workCtx.drawImage(
+    video,
+    (t.offsetX - box.x) * k,
+    (t.offsetY - box.y) * k,
+    t.vw * t.scale * k,
+    t.vh * t.scale * k
+  );
+  workCtx.restore();
+
+  if (filterId === "pixelate") pixelate(w, h);
+  if (filterId === "glitch") glitch(w, h);
+
+  // Put the small canvas back over the shape's box.
+  ctx.save();
+  ctx.imageSmoothingEnabled = filterId === "blur";
+  ctx.drawImage(workCanvas, box.x, box.y, box.w, box.h);
+  ctx.restore();
+}
+
 // ---------- Canvas drawing ----------
 
 function resizeCanvas() {
@@ -156,7 +390,7 @@ function resizeCanvas() {
 }
 
 // The video fills the window with object-fit: cover, which crops it.
-// This works out where the video sits so dots land on the real fingertips.
+// This works out where the video sits so shapes land on the real fingertips.
 function getCoverTransform() {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
@@ -199,6 +433,103 @@ function traceShape(shape) {
   ctx.closePath();
 }
 
+// A point a short way along the line from one point toward another.
+function armEnd(from, to, maxLength) {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const length = Math.hypot(dx, dy) || 1;
+  const arm = Math.min(maxLength, length * 0.4);
+  return { x: from.x + (dx / length) * arm, y: from.y + (dy / length) * arm };
+}
+
+// An L-shaped bracket at every corner, lined up with the two edges that
+// meet there, so the brackets follow whatever shape the fingers make.
+function drawBrackets(shape, dpr) {
+  const n = shape.length;
+  const arm = BRACKET_ARM * dpr;
+
+  ctx.save();
+  ctx.strokeStyle = markColor;
+  ctx.lineWidth = 4 * dpr;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.shadowColor = "rgba(0, 0, 0, 0.6)";
+  ctx.shadowBlur = 4 * dpr;
+
+  for (let i = 0; i < n; i++) {
+    const corner = shape[i];
+    const prev = shape[(i - 1 + n) % n];
+    const next = shape[(i + 1) % n];
+    const a = armEnd(corner, prev, arm);
+    const b = armEnd(corner, next, arm);
+
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(corner.x, corner.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+// Size label above the shape, like "MONO PIXELATE 487x293".
+// The canvas is mirrored by CSS, so the text is flipped here to read correctly.
+function drawLabel(shape, t, dpr) {
+  const xs = shape.map((p) => p.x);
+  const ys = shape.map((p) => p.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+
+  const width = Math.round((maxX - minX) / t.scale);
+  const height = Math.round((maxY - minY) / t.scale);
+  const filter = FILTERS[filterIndex];
+  const filterText = filter.id === "none" ? "" : ` ${filter.name}`;
+  const text = `${swapped ? "MONO" : "COLOR"}${filterText} ${width}x${height}`;
+
+  const fontSize = 11 * dpr;
+
+  ctx.save();
+  ctx.font = `bold ${fontSize}px Consolas, "Courier New", monospace`;
+  const textWidth = ctx.measureText(text).width;
+
+  // On screen the label starts at the left edge of the shape (canvas maxX).
+  const x = Math.min(Math.max(maxX, textWidth + 4 * dpr), canvas.width - 4 * dpr);
+  let y = minY - 8 * dpr;
+  if (y < fontSize + 4 * dpr) y = minY + fontSize + 8 * dpr;
+
+  ctx.translate(x, y);
+  ctx.scale(-1, 1);
+  ctx.lineJoin = "round";
+  ctx.lineWidth = 3 * dpr;
+  ctx.strokeStyle = "rgba(0, 0, 0, 0.7)";
+  ctx.strokeText(text, 0, 0);
+  ctx.fillStyle = markColor;
+  ctx.fillText(text, 0, 0);
+  ctx.restore();
+}
+
+// Small hollow rings on the fingertips, shown until a shape is formed.
+function drawMarkers(points, dpr) {
+  ctx.save();
+  ctx.strokeStyle = markColor;
+  ctx.lineWidth = 2 * dpr;
+  ctx.shadowColor = "rgba(0, 0, 0, 0.6)";
+  ctx.shadowBlur = 3 * dpr;
+
+  for (const handPoints of points) {
+    for (const p of handPoints) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 6 * dpr, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  ctx.restore();
+}
+
 function drawOverlay(hands) {
   clearCanvas();
   window.latestShape = [];
@@ -207,7 +538,7 @@ function drawOverlay(hands) {
   const t = getCoverTransform();
   const dpr = window.devicePixelRatio || 1;
 
-  // Only fingers that are out become dots and corners.
+  // Only fingers that are out become corners.
   const points = hands.map((hand, h) =>
     FINGERS.flatMap((finger, f) =>
       fingerStates[h][f] && SHAPE_FINGERS.includes(finger.name)
@@ -219,39 +550,51 @@ function drawOverlay(hands) {
   const total = points.flat().length;
   const bothHandsActive = points.length === 2 && points.every((p) => p.length > 0);
 
-  if (bothHandsActive && total >= 3) {
-    const shape = orderAroundCenter(points.flat());
-    window.latestShape = shape;
+  if (!bothHandsActive || total < 3) {
+    drawMarkers(points, dpr);
+    return;
+  }
 
-    // Normal color inside the shape: draw the plain video clipped to it.
-    // The video behind the canvas is gray, so everything outside stays gray.
-    ctx.save();
-    traceShape(shape);
-    ctx.clip();
+  const shape = orderAroundCenter(points.flat());
+  window.latestShape = shape;
+
+  // Inside the shape we draw the video again, clipped to the shape.
+  // Normal: the video behind is gray, so this draws it in color.
+  // Swapped: the video behind is in color, so this draws it gray with extra
+  // contrast. A filter, if one is chosen, changes the picture inside.
+  // Faint scanlines go on top in every mode.
+  const filterId = FILTERS[filterIndex].id;
+
+  ctx.save();
+  traceShape(shape);
+  ctx.clip();
+
+  if (filterId === "none") {
+    if (swapped) ctx.filter = "grayscale(1) contrast(1.25)";
     ctx.drawImage(video, t.offsetX, t.offsetY, t.vw * t.scale, t.vh * t.scale);
-    ctx.restore();
-
-    // Outline.
-    traceShape(shape);
-    ctx.strokeStyle = accent;
-    ctx.lineWidth = 3 * dpr;
-    ctx.lineJoin = "round";
-    ctx.stroke();
+    ctx.filter = "none";
+  } else {
+    drawFilteredVideo(filterId, shape, t);
   }
 
-  // Dots go last so they sit on top.
-  ctx.fillStyle = accent;
-  ctx.strokeStyle = "#ffffff";
-  ctx.lineWidth = 2 * dpr;
-
-  for (const handPoints of points) {
-    for (const p of handPoints) {
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, 7 * dpr, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-    }
+  if (scanlinePattern) {
+    ctx.fillStyle = scanlinePattern;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
   }
+  ctx.restore();
+
+  // Faint outline between the corners.
+  ctx.save();
+  traceShape(shape);
+  ctx.globalAlpha = 0.5;
+  ctx.strokeStyle = markColor;
+  ctx.lineWidth = 1.5 * dpr;
+  ctx.lineJoin = "round";
+  ctx.stroke();
+  ctx.restore();
+
+  drawBrackets(shape, dpr);
+  drawLabel(shape, t, dpr);
 }
 
 new ResizeObserver(resizeCanvas).observe(stage);
@@ -264,6 +607,9 @@ async function createHandLandmarker(vision, delegate) {
     baseOptions: { modelAssetPath: MODEL_URL, delegate },
     runningMode: "VIDEO",
     numHands: 2,
+    minHandDetectionConfidence: TRACKING_SENSITIVITY,
+    minHandPresenceConfidence: TRACKING_SENSITIVITY,
+    minTrackingConfidence: TRACKING_SENSITIVITY,
   });
 }
 
@@ -307,6 +653,15 @@ function trackLoop() {
 
     updateFingerStates(hands);
     drawOverlay(hands);
+
+    // Debug helper: frames per second, updated once a second.
+    fpsFrames++;
+    const now = performance.now();
+    if (now - fpsStart >= 1000) {
+      window.latestFps = Math.round((fpsFrames * 1000) / (now - fpsStart));
+      fpsFrames = 0;
+      fpsStart = now;
+    }
   }
 
   animationId = requestAnimationFrame(trackLoop);
@@ -318,6 +673,8 @@ function startTracking() {
   lastHandCount = -1;
   smoothedHands = [];
   fingerStates = [];
+  fpsFrames = 0;
+  fpsStart = performance.now();
   animationId = requestAnimationFrame(trackLoop);
 }
 
@@ -332,6 +689,7 @@ function stopTracking() {
   window.latestShape = [];
   window.latestFingers = [];
   window.latestRatios = [];
+  window.latestFps = 0;
   clearCanvas();
 }
 
@@ -384,6 +742,8 @@ async function startCamera() {
   }
 }
 
+// ---------- Buttons ----------
+
 startBtn.addEventListener("click", () => {
   if (stream) {
     stopCamera();
@@ -391,6 +751,28 @@ startBtn.addEventListener("click", () => {
     startCamera();
   }
 });
+
+swapBtn.addEventListener("click", () => {
+  applySwap(!swapped);
+  saveSetting(SWAP_KEY, String(swapped));
+});
+
+filterBtn.addEventListener("click", () => {
+  applyFilter(filterIndex + 1, true);
+  saveSetting(FILTER_KEY, String(filterIndex));
+});
+
+colorInput.addEventListener("input", () => {
+  applyColor(colorInput.value);
+  saveSetting(COLOR_KEY, colorInput.value);
+});
+
+// ---------- Start ----------
+
+const savedColor = loadSetting(COLOR_KEY);
+applyColor(/^#[0-9a-f]{6}$/i.test(savedColor || "") ? savedColor : DEFAULT_COLOR);
+applySwap(loadSetting(SWAP_KEY) === "true");
+applyFilter(Number(loadSetting(FILTER_KEY)) || 0, false);
 
 startBtn.disabled = false;
 console.log("Finger Shapes loaded");
