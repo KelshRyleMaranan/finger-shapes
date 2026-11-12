@@ -1,0 +1,15 @@
+{
+  "name": "finger-shapes",
+  "version": "1.0.0",
+  "description": "Hand-tracking webcam toy for laptops. Connect your fingers to make shapes: color inside, gray outside.",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron ."
+  },
+  "author": "Kelsh Ryle Maranan",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "45.3.1"
+  }
+}
