@@ -8,9 +8,21 @@ const WASM_URL =
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
-// MediaPipe point numbers for the fingertips that make the shape:
-// 4 = thumb, 8 = index. Add 12 (middle), 16 (ring), 20 (pinky) for more corners.
-const SHAPE_FINGERTIPS = [4, 8];
+// The fingers we can detect. tip / joint / base are MediaPipe point numbers.
+// A finger counts as "out" when its tip is far from the base compared with
+// its middle joint. "on" and "off" are two different limits, so a finger
+// that is half bent doesn't flicker on and off.
+const FINGERS = [
+  { name: "thumb", tip: 4, joint: 3, base: 17, on: 1.1, off: 1.0 },
+  { name: "index", tip: 8, joint: 6, base: 0, on: 1.3, off: 1.15 },
+  { name: "middle", tip: 12, joint: 10, base: 0, on: 1.3, off: 1.15 },
+  { name: "ring", tip: 16, joint: 14, base: 0, on: 1.3, off: 1.15 },
+  { name: "pinky", tip: 20, joint: 18, base: 0, on: 1.3, off: 1.15 },
+];
+
+// Which fingers can make corners. Remove a name to stop that finger
+// from ever counting, for example remove "ring" and "pinky" for fewer corners.
+const SHAPE_FINGERS = ["thumb", "index", "middle", "ring", "pinky"];
 
 const stage = document.getElementById("stage");
 const video = document.getElementById("video");
@@ -30,6 +42,7 @@ let animationId = null;
 let lastVideoTime = -1;
 let lastHandCount = -1;
 let smoothedHands = [];
+let fingerStates = [];
 
 function setStatus(message) {
   statusEl.textContent = message;
@@ -95,6 +108,45 @@ function smoothHands(rawHands) {
   return next;
 }
 
+// ---------- Finger gestures ----------
+
+function pixelDistance(a, b) {
+  return Math.hypot(
+    (a.x - b.x) * video.videoWidth,
+    (a.y - b.y) * video.videoHeight
+  );
+}
+
+function fingerRatio(hand, finger) {
+  const base = hand[finger.base];
+  const tipDistance = pixelDistance(hand[finger.tip], base);
+  const jointDistance = Math.max(pixelDistance(hand[finger.joint], base), 1e-6);
+  return tipDistance / jointDistance;
+}
+
+// Works out which fingers are out (true) or curled (false) on each hand.
+function updateFingerStates(hands) {
+  if (fingerStates.length !== hands.length) {
+    fingerStates = hands.map(() => []);
+  }
+
+  const ratios = hands.map((hand, h) =>
+    FINGERS.map((finger, f) => {
+      const ratio = fingerRatio(hand, finger);
+      const wasOut = fingerStates[h][f];
+      fingerStates[h][f] = wasOut ? ratio > finger.off : ratio > finger.on;
+      return ratio;
+    })
+  );
+
+  // Debug helpers for the Console. We remove them in a later commit.
+  // Order: thumb, index, middle, ring, pinky.
+  window.latestFingers = fingerStates.map((states) => states.slice());
+  window.latestRatios = ratios.map((row) =>
+    row.map((value) => Math.round(value * 100) / 100)
+  );
+}
+
 // ---------- Canvas drawing ----------
 
 function resizeCanvas() {
@@ -155,12 +207,19 @@ function drawOverlay(hands) {
   const t = getCoverTransform();
   const dpr = window.devicePixelRatio || 1;
 
-  // Chosen fingertip positions on the canvas, one list per hand.
-  const points = hands.map((hand) =>
-    SHAPE_FINGERTIPS.map((index) => toCanvas(hand[index], t))
+  // Only fingers that are out become dots and corners.
+  const points = hands.map((hand, h) =>
+    FINGERS.flatMap((finger, f) =>
+      fingerStates[h][f] && SHAPE_FINGERS.includes(finger.name)
+        ? [toCanvas(hand[finger.tip], t)]
+        : []
+    )
   );
 
-  if (points.length === 2) {
+  const total = points.flat().length;
+  const bothHandsActive = points.length === 2 && points.every((p) => p.length > 0);
+
+  if (bothHandsActive && total >= 3) {
     const shape = orderAroundCenter(points.flat());
     window.latestShape = shape;
 
@@ -246,6 +305,7 @@ function trackLoop() {
       console.log("Hands found:", count);
     }
 
+    updateFingerStates(hands);
     drawOverlay(hands);
   }
 
@@ -257,6 +317,7 @@ function startTracking() {
   lastVideoTime = -1;
   lastHandCount = -1;
   smoothedHands = [];
+  fingerStates = [];
   animationId = requestAnimationFrame(trackLoop);
 }
 
@@ -266,8 +327,11 @@ function stopTracking() {
     animationId = null;
   }
   smoothedHands = [];
+  fingerStates = [];
   window.latestHands = [];
   window.latestShape = [];
+  window.latestFingers = [];
+  window.latestRatios = [];
   clearCanvas();
 }
 
