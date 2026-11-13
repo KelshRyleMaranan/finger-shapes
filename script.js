@@ -33,9 +33,14 @@ const FINGERS = [
 const SHAPE_FINGERS = ["thumb", "index", "middle", "ring", "pinky"];
 
 // true  = the shape follows the order of your fingers, so it can fold over
-//         itself. Parts that overlap are merged, so the filter is applied once.
+//         itself.
 // false = the old behavior: a clean outline that never folds.
 const ALLOW_FOLDS = true;
+
+// Where two sections of the shape overlap:
+// false = the filter drops out there and the plain picture shows through.
+// true  = the filter is drawn once over the whole shape, overlaps included.
+const OVERLAP_KEEPS_FILTER = false;
 
 // The lines of the hand skeleton, as pairs of the 21 MediaPipe points.
 const HAND_BONES = [
@@ -377,7 +382,7 @@ function shapeBounds(shape) {
 }
 
 // Draws the pixelated or glitched video for the area around the shape.
-// The caller has already clipped the canvas to the shape.
+// The caller has already clipped the canvas to the area that gets the filter.
 function drawFilteredVideo(filterId, shape, t) {
   const box = shapeBounds(shape);
   if (box.w < 2 || box.h < 2) return;
@@ -476,7 +481,6 @@ function buildRing(handA, handB) {
 // Cuts the ring into sections: one triangle for each pair of neighboring
 // fingertips, all meeting at the middle of the ring. When the ring folds
 // over itself, some triangles land on top of each other.
-// Every triangle is turned the same way round so the overlaps merge.
 function buildSections(ring) {
   const center = {
     x: ring.reduce((sum, p) => sum + p.x, 0) / ring.length,
@@ -504,8 +508,9 @@ function makeShape(points) {
   return { ring, sections: buildSections(ring) };
 }
 
-// All sections as one path. Because they are in one path, a spot covered by
-// two sections is still just one spot, so the filter is drawn on it once.
+// All sections as one path. With the "nonzero" rule it covers every spot
+// that any section touches. With the "evenodd" rule it covers only the spots
+// touched by an odd number of sections, so overlaps are left out.
 function sectionsPath(sections) {
   const path = new Path2D();
   for (const section of sections) {
@@ -516,6 +521,26 @@ function sectionsPath(sections) {
     path.closePath();
   }
   return path;
+}
+
+// Debug helper: roughly what percent of the shape is overlapped.
+function overlapPercent(path, ring) {
+  const box = shapeBounds(ring);
+  const steps = 24;
+  let covered = 0;
+  let overlapped = 0;
+
+  for (let i = 0; i < steps; i++) {
+    for (let j = 0; j < steps; j++) {
+      const x = box.x + ((i + 0.5) * box.w) / steps;
+      const y = box.y + ((j + 0.5) * box.h) / steps;
+      if (!ctx.isPointInPath(path, x, y, "nonzero")) continue;
+      covered++;
+      if (!ctx.isPointInPath(path, x, y, "evenodd")) overlapped++;
+    }
+  }
+
+  return covered ? Math.round((overlapped * 100) / covered) : 0;
 }
 
 function traceShape(shape) {
@@ -633,6 +658,7 @@ function drawOverlay(hands) {
   clearCanvas();
   window.latestShape = [];
   window.latestSections = 0;
+  window.latestOverlap = 0;
   if (!video.videoWidth) return;
 
   const t = getCoverTransform();
@@ -655,41 +681,57 @@ function drawOverlay(hands) {
 
   if (bothHandsActive && total >= 3) {
     shape = makeShape(points);
+    const path = sectionsPath(shape.sections);
 
     // Debug helpers for the Console. We remove them in a later commit.
     window.latestShape = shape.ring;
     window.latestSections = shape.sections.length;
+    window.latestOverlap = overlapPercent(path, shape.ring);
 
-    // Inside the shape we draw the video again, clipped to the shape.
-    // Normal: the video behind is gray, so this draws it in color.
-    // Swapped: the video behind is in color, so this draws it gray with extra
-    // contrast. A filter, if one is on, changes the picture inside.
-    // The sections are merged into one area first, so a spot covered by
-    // two sections gets the filter once, never twice.
-    // Faint scanlines go on top in every mode.
     const filter = currentFilter();
     const filterId = filter ? filter.id : "none";
 
+    // Layer 1: everywhere the shape covers, draw the video again.
+    // Normal: the video behind is gray, so this draws it in color.
+    // Swapped: the video behind is in color, so this draws it gray with extra
+    // contrast.
     ctx.save();
-    ctx.clip(sectionsPath(shape.sections), "nonzero");
+    ctx.clip(path, "nonzero");
+    if (swapped) ctx.filter = "grayscale(1) contrast(1.25)";
+    ctx.drawImage(video, t.offsetX, t.offsetY, t.vw * t.scale, t.vh * t.scale);
+    ctx.filter = "none";
+    ctx.restore();
 
-    if (filterId === "pixelate" || filterId === "glitch") {
-      drawFilteredVideo(filterId, shape.ring, t);
-    } else {
-      const parts = [];
-      if (swapped) parts.push("grayscale(1) contrast(1.25)");
-      if (filterId === "invert") parts.push("invert(1)");
-      if (filterId === "invertSoft") parts.push("invert(1) hue-rotate(180deg)");
-      ctx.filter = parts.length ? parts.join(" ") : "none";
-      ctx.drawImage(video, t.offsetX, t.offsetY, t.vw * t.scale, t.vh * t.scale);
-      ctx.filter = "none";
+    // Layer 2: the filter. It is drawn only where the shape is one layer
+    // thick, so wherever two sections overlap, the plain picture from
+    // layer 1 shows through instead.
+    if (filterId !== "none") {
+      ctx.save();
+      ctx.clip(path, OVERLAP_KEEPS_FILTER ? "nonzero" : "evenodd");
+
+      if (filterId === "pixelate" || filterId === "glitch") {
+        drawFilteredVideo(filterId, shape.ring, t);
+      } else {
+        const parts = [];
+        if (swapped) parts.push("grayscale(1) contrast(1.25)");
+        if (filterId === "invert") parts.push("invert(1)");
+        if (filterId === "invertSoft") parts.push("invert(1) hue-rotate(180deg)");
+        ctx.filter = parts.join(" ");
+        ctx.drawImage(video, t.offsetX, t.offsetY, t.vw * t.scale, t.vh * t.scale);
+        ctx.filter = "none";
+      }
+
+      ctx.restore();
     }
 
+    // Faint scanlines over the whole shape.
     if (scanlinePattern) {
+      ctx.save();
+      ctx.clip(path, "nonzero");
       ctx.fillStyle = scanlinePattern;
       ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.restore();
     }
-    ctx.restore();
 
     drawOutline(shape.ring, dpr);
   }
@@ -791,6 +833,7 @@ function stopTracking() {
   window.latestHands = [];
   window.latestShape = [];
   window.latestSections = 0;
+  window.latestOverlap = 0;
   window.latestFingers = [];
   window.latestRatios = [];
   window.latestFps = 0;
