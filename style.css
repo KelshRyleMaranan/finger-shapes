@@ -49,12 +49,6 @@ body {
   height: 100%;
   object-fit: cover;
   transform: scaleX(-1);
-  filter: grayscale(1);
-}
-
-/* Swapped: the video behind is in color, and the shape is drawn gray. */
-.stage.swapped video {
-  filter: none;
 }
 
 .stage canvas {

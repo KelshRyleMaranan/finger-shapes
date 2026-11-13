@@ -28,28 +28,38 @@ const FINGERS = [
   { name: "pinky", tip: 20, joint: 18, base: 0, on: 1.3, off: 1.15 },
 ];
 
-// Which fingers can make corners. Remove a name to stop that finger
-// from ever counting, for example remove "ring" and "pinky" for fewer corners.
+// Which fingers can get a line. Remove a name to stop that finger
+// from ever counting, for example remove "ring" and "pinky" for fewer lines.
 const SHAPE_FINGERS = ["thumb", "index", "middle", "ring", "pinky"];
 
-// true  = the shape follows the order of your fingers, so it can fold over
-//         itself.
-// false = the old behavior: a clean outline that never folds.
-const ALLOW_FOLDS = true;
+// true  = a closed finger is not drawn at all (no dots, no bones).
+// false = the whole hand skeleton is always drawn.
+const HIDE_CLOSED_FINGERS = true;
+
+// How thick the lines are, in screen pixels.
+// The outline traces the whole shape. The lines inside it are thinner.
+const OUTLINE_WIDTH = 4;
+const INNER_LINE_WIDTH = 1.5;
+
+// true  = a faint line texture over the shape.
+// false = no texture, the shape is only marked by its lines.
+const SHOW_SCANLINES = true;
 
 // Where two sections of the shape overlap:
 // false = the filter drops out there and the plain picture shows through.
 // true  = the filter is drawn once over the whole shape, overlaps included.
 const OVERLAP_KEEPS_FILTER = false;
 
-// The lines of the hand skeleton, as pairs of the 21 MediaPipe points.
-const HAND_BONES = [
-  [0, 1], [1, 2], [2, 3], [3, 4],
-  [0, 5], [5, 6], [6, 7], [7, 8],
-  [5, 9], [9, 10], [10, 11], [11, 12],
-  [9, 13], [13, 14], [14, 15], [15, 16],
-  [13, 17], [17, 18], [18, 19], [19, 20],
-  [0, 17],
+// The hand skeleton. The palm is always drawn. Each finger has its own
+// bones and joints (same order as FINGERS), so a closed finger can be hidden.
+const PALM_BONES = [[0, 1], [0, 5], [5, 9], [9, 13], [13, 17], [0, 17]];
+const PALM_JOINTS = [0, 1, 5, 9, 13, 17];
+const FINGER_PARTS = [
+  { bones: [[1, 2], [2, 3], [3, 4]], joints: [2, 3, 4] },
+  { bones: [[5, 6], [6, 7], [7, 8]], joints: [6, 7, 8] },
+  { bones: [[9, 10], [10, 11], [11, 12]], joints: [10, 11, 12] },
+  { bones: [[13, 14], [14, 15], [15, 16]], joints: [14, 15, 16] },
+  { bones: [[17, 18], [18, 19], [19, 20]], joints: [18, 19, 20] },
 ];
 
 // Camcorder yellow. The person can change it with the color control.
@@ -72,21 +82,19 @@ const FILTER_SWITCH_SECONDS = 4;
 const FILTER_WORK_WIDTH = 480;
 
 const COLOR_KEY = "fingerShapes.color";
-const SWAP_KEY = "fingerShapes.swap";
 const FILTERS_ON_KEY = "fingerShapes.randomFilters";
+const OLD_SWAP_KEY = "fingerShapes.swap";
 
 const stage = document.getElementById("stage");
 const video = document.getElementById("video");
 const canvas = document.getElementById("overlay");
 const ctx = canvas.getContext("2d");
 const startBtn = document.getElementById("startBtn");
-const swapBtn = document.getElementById("swapBtn");
 const filterBtn = document.getElementById("filterBtn");
 const colorInput = document.getElementById("colorInput");
 const statusEl = document.getElementById("status");
 
 let markColor = DEFAULT_COLOR;
-let swapped = false;
 let filtersOn = false;
 let filterIndex = 0;
 let filterTimer = null;
@@ -100,6 +108,14 @@ let smoothedHands = [];
 let fingerStates = [];
 let fpsFrames = 0;
 let fpsStart = 0;
+
+// Remembers which fingertip each finger was connected to when its partner
+// on the other hand wasn't raised, so the line doesn't jump back and forth.
+let rungMemory = { a: new Map(), b: new Map() };
+
+function resetRungMemory() {
+  rungMemory = { a: new Map(), b: new Map() };
+}
 
 // A tiny tile of faint dark lines, repeated to make a scanline texture.
 const scanlineTile = document.createElement("canvas");
@@ -153,15 +169,17 @@ function saveSetting(key, value) {
   }
 }
 
+function removeSetting(key) {
+  try {
+    localStorage.removeItem(key);
+  } catch (error) {
+    // Nothing to remove.
+  }
+}
+
 function applyColor(color) {
   markColor = color;
   colorInput.value = color;
-}
-
-function applySwap(on) {
-  swapped = on;
-  stage.classList.toggle("swapped", on);
-  swapBtn.setAttribute("aria-pressed", String(on));
 }
 
 // Picks a random filter that is different from the current one.
@@ -177,7 +195,7 @@ function pickRandomFilter() {
 }
 
 // The filter control is a one-click switch. On = a random filter that
-// changes every few seconds. Off = the normal look.
+// changes every few seconds. Off = no filter.
 function setFiltersOn(on) {
   filtersOn = on;
   clearInterval(filterTimer);
@@ -371,9 +389,9 @@ function glitch(w, h) {
   workCtx.putImageData(new ImageData(out, w, h), 0, 0);
 }
 
-function shapeBounds(shape) {
-  const xs = shape.map((p) => p.x);
-  const ys = shape.map((p) => p.y);
+function shapeBounds(points) {
+  const xs = points.map((p) => p.x);
+  const ys = points.map((p) => p.y);
   const x0 = Math.max(0, Math.floor(Math.min(...xs)));
   const y0 = Math.max(0, Math.floor(Math.min(...ys)));
   const x1 = Math.min(canvas.width, Math.ceil(Math.max(...xs)));
@@ -383,8 +401,8 @@ function shapeBounds(shape) {
 
 // Draws the pixelated or glitched video for the area around the shape.
 // The caller has already clipped the canvas to the area that gets the filter.
-function drawFilteredVideo(filterId, shape, t) {
-  const box = shapeBounds(shape);
+function drawFilteredVideo(filterId, corners, t) {
+  const box = shapeBounds(corners);
   if (box.w < 2 || box.h < 2) return;
 
   const k = Math.min(1, FILTER_WORK_WIDTH / box.w);
@@ -394,8 +412,6 @@ function drawFilteredVideo(filterId, shape, t) {
   workCanvas.height = h;
 
   // Draw the video onto the small canvas, lined up with the shape's box.
-  workCtx.save();
-  workCtx.filter = swapped ? "grayscale(1) contrast(1.25)" : "none";
   workCtx.drawImage(
     video,
     (t.offsetX - box.x) * k,
@@ -403,7 +419,6 @@ function drawFilteredVideo(filterId, shape, t) {
     t.vw * t.scale * k,
     t.vh * t.scale * k
   );
-  workCtx.restore();
 
   if (filterId === "pixelate") pixelate(w, h);
   if (filterId === "glitch") glitch(w, h);
@@ -449,63 +464,89 @@ function clearCanvas() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 }
 
-// ---------- Shape sections ----------
-
-// Sorts points by angle around their center so the outline never twists.
-// Only used when ALLOW_FOLDS is false.
-function orderAroundCenter(points) {
-  const cx = points.reduce((sum, p) => sum + p.x, 0) / points.length;
-  const cy = points.reduce((sum, p) => sum + p.y, 0) / points.length;
-  return points
-    .slice()
-    .sort((a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx));
-}
+// ---------- Lines and sections ----------
 
 function distance(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
-// Joins the fingertips into one loop: hand 1's fingers in order (thumb to
-// pinky), then hand 2's. Hand 2's fingers are flipped if that makes the two
-// lines that join the hands shorter, so a normal pose doesn't twist.
-function buildRing(handA, handB) {
-  const lastA = handA[handA.length - 1];
-  const lastB = handB[handB.length - 1];
-  const straight = distance(lastA, handB[0]) + distance(lastB, handA[0]);
-  const flipped = distance(lastA, lastB) + distance(handB[0], handA[0]);
-  return flipped < straight
-    ? [...handA, ...handB.slice().reverse()]
-    : [...handA, ...handB];
+function closestTip(from, list) {
+  return list.reduce((best, tip) =>
+    distance(from.p, tip.p) < distance(from.p, best.p) ? tip : best
+  );
 }
 
-// Cuts the ring into sections: one triangle for each pair of neighboring
-// fingertips, all meeting at the middle of the ring. When the ring folds
-// over itself, some triangles land on top of each other.
-function buildSections(ring) {
-  const center = {
-    x: ring.reduce((sum, p) => sum + p.x, 0) / ring.length,
-    y: ring.reduce((sum, p) => sum + p.y, 0) / ring.length,
+// Picks the fingertip on the other hand that a finger connects to:
+//  - the same finger, if it is raised,
+//  - otherwise the closest raised fingertip. To stop the line from jumping
+//    between two fingertips that are almost the same distance, it keeps
+//    its last target unless another one is clearly closer.
+function pickTarget(from, others, memory) {
+  const facing = others.find((o) => o.f === from.f);
+  if (facing) {
+    memory.set(from.f, facing.f);
+    return facing;
+  }
+
+  const closest = closestTip(from, others);
+  const kept = others.find((o) => o.f === memory.get(from.f));
+  if (kept && distance(from.p, kept.p) <= distance(from.p, closest.p) * 1.25) {
+    return kept;
+  }
+
+  memory.set(from.f, closest.f);
+  return closest;
+}
+
+// One line (a "rung") for every raised finger. Each line goes from one hand
+// to the other, never between two fingers of the same hand.
+// handA and handB are lists of { f: finger number, p: fingertip position }.
+function buildRungs(handA, handB) {
+  const rungs = [];
+  const seen = new Set();
+
+  const add = (a, b) => {
+    const key = `${a.f}-${b.f}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    rungs.push({ a, b });
   };
 
+  for (const a of handA) add(a, pickTarget(a, handB, rungMemory.a));
+  for (const b of handB) add(pickTarget(b, handA, rungMemory.b), b);
+
+  // Thumb side first, pinky side last.
+  rungs.sort((r1, r2) => r1.a.f - r2.a.f || r1.b.f - r2.b.f);
+  return rungs;
+}
+
+// Adds a triangle, turned the same way round as all the others, so the
+// sections add up (and cancel in overlaps) the way we want.
+function addTriangle(list, p, q, r) {
+  const area = (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+  if (Math.abs(area) < 1) return;
+  list.push(area > 0 ? [p, q, r] : [p, r, q]);
+}
+
+// The filled area is what lies between two neighboring lines, like the
+// space between two rungs of a ladder. Each space is cut into two triangles.
+function buildSections(rungs) {
   const sections = [];
-  for (let i = 0; i < ring.length; i++) {
-    const a = ring[i];
-    const b = ring[(i + 1) % ring.length];
-    const area = (a.x - center.x) * (b.y - center.y) - (a.y - center.y) * (b.x - center.x);
-    if (Math.abs(area) < 1) continue;
-    sections.push(area > 0 ? [center, a, b] : [center, b, a]);
+  for (let i = 0; i < rungs.length - 1; i++) {
+    const a1 = rungs[i].a.p;
+    const b1 = rungs[i].b.p;
+    const a2 = rungs[i + 1].a.p;
+    const b2 = rungs[i + 1].b.p;
+    addTriangle(sections, a1, b1, b2);
+    addTriangle(sections, a1, b2, a2);
   }
   return sections;
 }
 
-// The shape: its outline (the ring of fingertips) and its sections.
-function makeShape(points) {
-  if (!ALLOW_FOLDS) {
-    const ring = orderAroundCenter(points.flat());
-    return { ring, sections: [ring] };
-  }
-  const ring = buildRing(points[0], points[1]);
-  return { ring, sections: buildSections(ring) };
+function makeShape(tips) {
+  const rungs = buildRungs(tips[0], tips[1]);
+  const corners = rungs.flatMap((r) => [r.a.p, r.b.p]);
+  return { rungs, corners, sections: buildSections(rungs) };
 }
 
 // All sections as one path. With the "nonzero" rule it covers every spot
@@ -524,8 +565,8 @@ function sectionsPath(sections) {
 }
 
 // Debug helper: roughly what percent of the shape is overlapped.
-function overlapPercent(path, ring) {
-  const box = shapeBounds(ring);
+function overlapPercent(path, corners) {
+  const box = shapeBounds(corners);
   const steps = 24;
   let covered = 0;
   let overlapped = 0;
@@ -543,31 +584,52 @@ function overlapPercent(path, ring) {
   return covered ? Math.round((overlapped * 100) / covered) : 0;
 }
 
-function traceShape(shape) {
-  ctx.beginPath();
-  ctx.moveTo(shape[0].x, shape[0].y);
-  for (let i = 1; i < shape.length; i++) {
-    ctx.lineTo(shape[i].x, shape[i].y);
-  }
-  ctx.closePath();
+// The outline goes along hand A's fingertips (thumb side to pinky side),
+// across the last line, back along hand B's fingertips, and across the
+// first line. It follows whatever shape the raised fingers make.
+function outlinePoints(rungs) {
+  return [...rungs.map((r) => r.a.p), ...rungs.map((r) => r.b.p).reverse()];
 }
 
-// Thin white outline around the shape.
-function drawOutline(shape, dpr) {
+// The white lines: thin ones inside, a thicker outline around the shape.
+function drawLines(rungs, dpr) {
   ctx.save();
-  traceShape(shape);
   ctx.strokeStyle = "rgba(255, 255, 255, 0.92)";
-  ctx.lineWidth = 2 * dpr;
+  ctx.lineCap = "round";
   ctx.lineJoin = "round";
   ctx.shadowColor = "rgba(0, 0, 0, 0.45)";
   ctx.shadowBlur = 3 * dpr;
+
+  // Thin lines: every line except the first and last, which are part of
+  // the outline.
+  if (rungs.length > 2) {
+    ctx.lineWidth = INNER_LINE_WIDTH * dpr;
+    ctx.beginPath();
+    for (let i = 1; i < rungs.length - 1; i++) {
+      ctx.moveTo(rungs[i].a.p.x, rungs[i].a.p.y);
+      ctx.lineTo(rungs[i].b.p.x, rungs[i].b.p.y);
+    }
+    ctx.stroke();
+  }
+
+  // Thick outline.
+  const ring = outlinePoints(rungs);
+  ctx.lineWidth = OUTLINE_WIDTH * dpr;
+  ctx.beginPath();
+  ctx.moveTo(ring[0].x, ring[0].y);
+  for (let i = 1; i < ring.length; i++) {
+    ctx.lineTo(ring[i].x, ring[i].y);
+  }
+  ctx.closePath();
   ctx.stroke();
+
   ctx.restore();
 }
 
-// The hand skeleton: thin lines between the 21 points and a small dot on
-// every joint. Fingertips that count as corners get a bigger dot with a
-// white ring, so you can see which fingers make the shape.
+// The hand skeleton: thin lines between the joints and a small dot on
+// every joint. The palm is always drawn. A closed finger is left out when
+// HIDE_CLOSED_FINGERS is on. Raised fingertips that get a line also get a
+// bigger dot with a white ring.
 function drawHands(hands, t, dpr) {
   ctx.save();
   ctx.lineCap = "round";
@@ -577,13 +639,22 @@ function drawHands(hands, t, dpr) {
 
   hands.forEach((hand, h) => {
     const pts = hand.map((p) => toCanvas(p, t));
+    const bones = [...PALM_BONES];
+    const joints = [...PALM_JOINTS];
+
+    FINGER_PARTS.forEach((part, f) => {
+      const raised = fingerStates[h] && fingerStates[h][f];
+      if (HIDE_CLOSED_FINGERS && !raised) return;
+      bones.push(...part.bones);
+      joints.push(...part.joints);
+    });
 
     // Bones.
     ctx.globalAlpha = 0.75;
     ctx.strokeStyle = markColor;
     ctx.lineWidth = 2 * dpr;
     ctx.beginPath();
-    for (const [a, b] of HAND_BONES) {
+    for (const [a, b] of bones) {
       ctx.moveTo(pts[a].x, pts[a].y);
       ctx.lineTo(pts[b].x, pts[b].y);
     }
@@ -592,13 +663,13 @@ function drawHands(hands, t, dpr) {
     // Joints.
     ctx.globalAlpha = 1;
     ctx.fillStyle = markColor;
-    for (const p of pts) {
+    for (const i of joints) {
       ctx.beginPath();
-      ctx.arc(p.x, p.y, 3 * dpr, 0, Math.PI * 2);
+      ctx.arc(pts[i].x, pts[i].y, 3 * dpr, 0, Math.PI * 2);
       ctx.fill();
     }
 
-    // Bigger dots on the fingertips that are corners of the shape.
+    // Bigger dots on the raised fingertips.
     ctx.strokeStyle = "#ffffff";
     ctx.lineWidth = 2 * dpr;
     FINGERS.forEach((finger, f) => {
@@ -616,47 +687,10 @@ function drawHands(hands, t, dpr) {
   ctx.restore();
 }
 
-// Size label above the shape, like "MONO PIXELATE 487x293".
-// The canvas is mirrored by CSS, so the text is flipped here to read correctly.
-function drawLabel(shape, t, dpr) {
-  const xs = shape.map((p) => p.x);
-  const ys = shape.map((p) => p.y);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const minY = Math.min(...ys);
-  const maxY = Math.max(...ys);
-
-  const width = Math.round((maxX - minX) / t.scale);
-  const height = Math.round((maxY - minY) / t.scale);
-  const filter = currentFilter();
-  const filterText = filter ? ` ${filter.name}` : "";
-  const text = `${swapped ? "MONO" : "COLOR"}${filterText} ${width}x${height}`;
-
-  const fontSize = 11 * dpr;
-
-  ctx.save();
-  ctx.font = `bold ${fontSize}px Consolas, "Courier New", monospace`;
-  const textWidth = ctx.measureText(text).width;
-
-  // On screen the label starts at the left edge of the shape (canvas maxX).
-  const x = Math.min(Math.max(maxX, textWidth + 4 * dpr), canvas.width - 4 * dpr);
-  let y = minY - 8 * dpr;
-  if (y < fontSize + 4 * dpr) y = minY + fontSize + 8 * dpr;
-
-  ctx.translate(x, y);
-  ctx.scale(-1, 1);
-  ctx.lineJoin = "round";
-  ctx.lineWidth = 3 * dpr;
-  ctx.strokeStyle = "rgba(0, 0, 0, 0.7)";
-  ctx.strokeText(text, 0, 0);
-  ctx.fillStyle = markColor;
-  ctx.fillText(text, 0, 0);
-  ctx.restore();
-}
-
 function drawOverlay(hands) {
   clearCanvas();
-  window.latestShape = [];
+  window.latestRungs = 0;
+  window.latestRungList = [];
   window.latestSections = 0;
   window.latestOverlap = 0;
   if (!video.videoWidth) return;
@@ -664,82 +698,67 @@ function drawOverlay(hands) {
   const t = getCoverTransform();
   const dpr = window.devicePixelRatio || 1;
 
-  // Only fingers that are out become corners, in finger order
-  // (thumb, index, middle, ring, pinky).
-  const points = hands.map((hand, h) =>
+  // The raised fingertips of each hand, with their finger number
+  // (0 thumb, 1 index, 2 middle, 3 ring, 4 pinky).
+  const tips = hands.map((hand, h) =>
     FINGERS.flatMap((finger, f) =>
       fingerStates[h][f] && SHAPE_FINGERS.includes(finger.name)
-        ? [toCanvas(hand[finger.tip], t)]
+        ? [{ f, p: toCanvas(hand[finger.tip], t) }]
         : []
     )
   );
 
-  const total = points.flat().length;
-  const bothHandsActive = points.length === 2 && points.every((p) => p.length > 0);
+  const bothHandsActive = tips.length === 2 && tips.every((list) => list.length > 0);
 
-  let shape = null;
-
-  if (bothHandsActive && total >= 3) {
-    shape = makeShape(points);
-    const path = sectionsPath(shape.sections);
+  if (bothHandsActive) {
+    const shape = makeShape(tips);
 
     // Debug helpers for the Console. We remove them in a later commit.
-    window.latestShape = shape.ring;
+    window.latestRungs = shape.rungs.length;
+    window.latestRungList = shape.rungs.map(
+      (r) => `${FINGERS[r.a.f].name}-${FINGERS[r.b.f].name}`
+    );
     window.latestSections = shape.sections.length;
-    window.latestOverlap = overlapPercent(path, shape.ring);
 
-    const filter = currentFilter();
-    const filterId = filter ? filter.id : "none";
+    // The area between the lines needs at least two lines.
+    if (shape.sections.length > 0) {
+      const path = sectionsPath(shape.sections);
+      window.latestOverlap = overlapPercent(path, shape.corners);
 
-    // Layer 1: everywhere the shape covers, draw the video again.
-    // Normal: the video behind is gray, so this draws it in color.
-    // Swapped: the video behind is in color, so this draws it gray with extra
-    // contrast.
-    ctx.save();
-    ctx.clip(path, "nonzero");
-    if (swapped) ctx.filter = "grayscale(1) contrast(1.25)";
-    ctx.drawImage(video, t.offsetX, t.offsetY, t.vw * t.scale, t.vh * t.scale);
-    ctx.filter = "none";
-    ctx.restore();
+      // The filter is drawn only where the shape is one layer thick, so
+      // wherever two sections overlap, the plain picture shows through.
+      const filter = currentFilter();
+      if (filter) {
+        ctx.save();
+        ctx.clip(path, OVERLAP_KEEPS_FILTER ? "nonzero" : "evenodd");
 
-    // Layer 2: the filter. It is drawn only where the shape is one layer
-    // thick, so wherever two sections overlap, the plain picture from
-    // layer 1 shows through instead.
-    if (filterId !== "none") {
-      ctx.save();
-      ctx.clip(path, OVERLAP_KEEPS_FILTER ? "nonzero" : "evenodd");
+        if (filter.id === "pixelate" || filter.id === "glitch") {
+          drawFilteredVideo(filter.id, shape.corners, t);
+        } else {
+          ctx.filter =
+            filter.id === "invert" ? "invert(1)" : "invert(1) hue-rotate(180deg)";
+          ctx.drawImage(video, t.offsetX, t.offsetY, t.vw * t.scale, t.vh * t.scale);
+          ctx.filter = "none";
+        }
 
-      if (filterId === "pixelate" || filterId === "glitch") {
-        drawFilteredVideo(filterId, shape.ring, t);
-      } else {
-        const parts = [];
-        if (swapped) parts.push("grayscale(1) contrast(1.25)");
-        if (filterId === "invert") parts.push("invert(1)");
-        if (filterId === "invertSoft") parts.push("invert(1) hue-rotate(180deg)");
-        ctx.filter = parts.join(" ");
-        ctx.drawImage(video, t.offsetX, t.offsetY, t.vw * t.scale, t.vh * t.scale);
-        ctx.filter = "none";
+        ctx.restore();
       }
 
-      ctx.restore();
+      // Faint scanlines over the whole shape.
+      if (SHOW_SCANLINES && scanlinePattern) {
+        ctx.save();
+        ctx.clip(path, "nonzero");
+        ctx.fillStyle = scanlinePattern;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.restore();
+      }
     }
 
-    // Faint scanlines over the whole shape.
-    if (scanlinePattern) {
-      ctx.save();
-      ctx.clip(path, "nonzero");
-      ctx.fillStyle = scanlinePattern;
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.restore();
-    }
-
-    drawOutline(shape.ring, dpr);
+    drawLines(shape.rungs, dpr);
   }
 
   // The hand skeletons go on top of the shape.
   drawHands(hands, t, dpr);
-
-  if (shape) drawLabel(shape.ring, t, dpr);
 }
 
 new ResizeObserver(resizeCanvas).observe(stage);
@@ -818,6 +837,7 @@ function startTracking() {
   lastHandCount = -1;
   smoothedHands = [];
   fingerStates = [];
+  resetRungMemory();
   fpsFrames = 0;
   fpsStart = performance.now();
   animationId = requestAnimationFrame(trackLoop);
@@ -830,8 +850,10 @@ function stopTracking() {
   }
   smoothedHands = [];
   fingerStates = [];
+  resetRungMemory();
   window.latestHands = [];
-  window.latestShape = [];
+  window.latestRungs = 0;
+  window.latestRungList = [];
   window.latestSections = 0;
   window.latestOverlap = 0;
   window.latestFingers = [];
@@ -899,11 +921,6 @@ startBtn.addEventListener("click", () => {
   }
 });
 
-swapBtn.addEventListener("click", () => {
-  applySwap(!swapped);
-  saveSetting(SWAP_KEY, String(swapped));
-});
-
 filterBtn.addEventListener("click", () => {
   setFiltersOn(!filtersOn);
   saveSetting(FILTERS_ON_KEY, String(filtersOn));
@@ -918,8 +935,8 @@ colorInput.addEventListener("input", () => {
 
 const savedColor = loadSetting(COLOR_KEY);
 applyColor(/^#[0-9a-f]{6}$/i.test(savedColor || "") ? savedColor : DEFAULT_COLOR);
-applySwap(loadSetting(SWAP_KEY) === "true");
 setFiltersOn(loadSetting(FILTERS_ON_KEY) === "true");
+removeSetting(OLD_SWAP_KEY);
 
 startBtn.disabled = false;
 console.log("Finger Shapes loaded");

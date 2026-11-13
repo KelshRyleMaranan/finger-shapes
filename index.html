@@ -6,7 +6,7 @@
   <title>Finger Shapes</title>
   <meta
     name="description"
-    content="Hand-tracking webcam toy. Connect your fingers to make shapes: color inside, gray outside."
+    content="Hand-tracking webcam toy. Connect your fingers to make shapes and fill them with live filters."
   />
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -30,31 +30,6 @@
         </svg>
         <input id="colorInput" type="color" value="#ffd21f" aria-label="Color" />
       </label>
-
-      <button
-        id="swapBtn"
-        class="tool"
-        type="button"
-        aria-label="Swap colors"
-        aria-pressed="false"
-      >
-        <svg
-          width="24"
-          height="24"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.6"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          aria-hidden="true"
-        >
-          <rect x="3" y="5" width="18" height="14" rx="2.5" />
-          <circle cx="9" cy="10" r="1.6" />
-          <path d="M4.5 17l4.5-4.5 3 3 2.5-2.5 5 4" />
-          <path class="slash" d="M4 3.5l16 17" />
-        </svg>
-      </button>
 
       <button
         id="filterBtn"
