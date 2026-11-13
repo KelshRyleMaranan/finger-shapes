@@ -32,19 +32,30 @@ const FINGERS = [
 // from ever counting, for example remove "ring" and "pinky" for fewer corners.
 const SHAPE_FINGERS = ["thumb", "index", "middle", "ring", "pinky"];
 
+// The lines of the hand skeleton, as pairs of the 21 MediaPipe points.
+const HAND_BONES = [
+  [0, 1], [1, 2], [2, 3], [3, 4],
+  [0, 5], [5, 6], [6, 7], [7, 8],
+  [5, 9], [9, 10], [10, 11], [11, 12],
+  [9, 13], [13, 14], [14, 15], [15, 16],
+  [13, 17], [17, 18], [18, 19], [19, 20],
+  [0, 17],
+];
+
 // Camcorder yellow. The person can change it with the color circle.
 const DEFAULT_COLOR = "#ffd21f";
 
-// How long each bracket arm can be, in screen pixels.
-const BRACKET_ARM = 26;
-
-// Filters that can be applied inside the shape.
+// Filters that can be applied inside the shape. When the filter button is
+// on, one of these is picked at random and changes every few seconds.
 const FILTERS = [
-  { id: "none", name: "NONE" },
   { id: "pixelate", name: "PIXELATE" },
-  { id: "blur", name: "BLUR" },
   { id: "glitch", name: "GLITCH" },
+  { id: "invert", name: "INVERT" },
+  { id: "invertSoft", name: "INVERT SOFT" },
 ];
+
+// How often the random filter changes, in seconds.
+const FILTER_SWITCH_SECONDS = 4;
 
 // Filters work on a smaller copy of the video (this wide, in pixels)
 // so a big shape doesn't slow the app down.
@@ -52,7 +63,7 @@ const FILTER_WORK_WIDTH = 480;
 
 const COLOR_KEY = "fingerShapes.color";
 const SWAP_KEY = "fingerShapes.swap";
-const FILTER_KEY = "fingerShapes.filter";
+const FILTERS_ON_KEY = "fingerShapes.randomFilters";
 
 const stage = document.getElementById("stage");
 const video = document.getElementById("video");
@@ -67,7 +78,9 @@ const toastEl = document.getElementById("toast");
 
 let markColor = DEFAULT_COLOR;
 let swapped = false;
+let filtersOn = false;
 let filterIndex = 0;
+let filterTimer = null;
 let toastTimer = null;
 
 let stream = null;
@@ -151,13 +164,41 @@ function applySwap(on) {
   swapBtn.setAttribute("aria-pressed", String(on));
 }
 
-function applyFilter(index, announce) {
-  filterIndex = ((index % FILTERS.length) + FILTERS.length) % FILTERS.length;
-  const filter = FILTERS[filterIndex];
-  filterBtn.title = `Filter: ${filter.name}`;
-  filterBtn.setAttribute("aria-label", `Filter: ${filter.name}. Click to change.`);
-  filterBtn.dataset.active = String(filter.id !== "none");
-  if (announce) showToast(`FILTER: ${filter.name}`);
+// Picks a random filter that is different from the current one.
+function pickRandomFilter() {
+  let next = filterIndex;
+  while (next === filterIndex && FILTERS.length > 1) {
+    next = Math.floor(Math.random() * FILTERS.length);
+  }
+  filterIndex = next;
+
+  // Debug helper for the Console. We remove it in a later commit.
+  window.latestFilter = FILTERS[filterIndex].id;
+}
+
+// The filter button is a one-click switch. On = a random filter that
+// changes every few seconds. Off = the normal look.
+function setFiltersOn(on, announce) {
+  filtersOn = on;
+  clearInterval(filterTimer);
+  filterTimer = null;
+
+  if (on) {
+    filterIndex = -1;
+    pickRandomFilter();
+    filterTimer = setInterval(pickRandomFilter, FILTER_SWITCH_SECONDS * 1000);
+  } else {
+    window.latestFilter = "off";
+  }
+
+  filterBtn.setAttribute("aria-pressed", String(on));
+  filterBtn.setAttribute("aria-label", "Random filters");
+  filterBtn.title = `Random filters: ${on ? "ON" : "OFF"}`;
+  if (announce) showToast(on ? "FILTERS: RANDOM" : "FILTERS: OFF");
+}
+
+function currentFilter() {
+  return filtersOn ? FILTERS[filterIndex] : null;
 }
 
 // ---------- Smoothing ----------
@@ -343,7 +384,7 @@ function shapeBounds(shape) {
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 
-// Draws the filtered video for the area around the shape.
+// Draws the pixelated or glitched video for the area around the shape.
 // The caller has already clipped the canvas to the shape.
 function drawFilteredVideo(filterId, shape, t) {
   const box = shapeBounds(shape);
@@ -356,12 +397,8 @@ function drawFilteredVideo(filterId, shape, t) {
   workCanvas.height = h;
 
   // Draw the video onto the small canvas, lined up with the shape's box.
-  const parts = [];
-  if (swapped) parts.push("grayscale(1) contrast(1.25)");
-  if (filterId === "blur") parts.push(`blur(${Math.max(2, Math.round(w / 70))}px)`);
-
   workCtx.save();
-  workCtx.filter = parts.length ? parts.join(" ") : "none";
+  workCtx.filter = swapped ? "grayscale(1) contrast(1.25)" : "none";
   workCtx.drawImage(
     video,
     (t.offsetX - box.x) * k,
@@ -376,7 +413,7 @@ function drawFilteredVideo(filterId, shape, t) {
 
   // Put the small canvas back over the shape's box.
   ctx.save();
-  ctx.imageSmoothingEnabled = filterId === "blur";
+  ctx.imageSmoothingEnabled = false;
   ctx.drawImage(workCanvas, box.x, box.y, box.w, box.h);
   ctx.restore();
 }
@@ -433,42 +470,66 @@ function traceShape(shape) {
   ctx.closePath();
 }
 
-// A point a short way along the line from one point toward another.
-function armEnd(from, to, maxLength) {
-  const dx = to.x - from.x;
-  const dy = to.y - from.y;
-  const length = Math.hypot(dx, dy) || 1;
-  const arm = Math.min(maxLength, length * 0.4);
-  return { x: from.x + (dx / length) * arm, y: from.y + (dy / length) * arm };
+// Thin white outline around the shape.
+function drawOutline(shape, dpr) {
+  ctx.save();
+  traceShape(shape);
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.92)";
+  ctx.lineWidth = 2 * dpr;
+  ctx.lineJoin = "round";
+  ctx.shadowColor = "rgba(0, 0, 0, 0.45)";
+  ctx.shadowBlur = 3 * dpr;
+  ctx.stroke();
+  ctx.restore();
 }
 
-// An L-shaped bracket at every corner, lined up with the two edges that
-// meet there, so the brackets follow whatever shape the fingers make.
-function drawBrackets(shape, dpr) {
-  const n = shape.length;
-  const arm = BRACKET_ARM * dpr;
-
+// The hand skeleton: thin lines between the 21 points and a small dot on
+// every joint. Fingertips that count as corners get a bigger dot with a
+// white ring, so you can see which fingers make the shape.
+function drawHands(hands, t, dpr) {
   ctx.save();
-  ctx.strokeStyle = markColor;
-  ctx.lineWidth = 4 * dpr;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  ctx.shadowColor = "rgba(0, 0, 0, 0.6)";
-  ctx.shadowBlur = 4 * dpr;
+  ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
+  ctx.shadowBlur = 3 * dpr;
 
-  for (let i = 0; i < n; i++) {
-    const corner = shape[i];
-    const prev = shape[(i - 1 + n) % n];
-    const next = shape[(i + 1) % n];
-    const a = armEnd(corner, prev, arm);
-    const b = armEnd(corner, next, arm);
+  hands.forEach((hand, h) => {
+    const pts = hand.map((p) => toCanvas(p, t));
 
+    // Bones.
+    ctx.globalAlpha = 0.75;
+    ctx.strokeStyle = markColor;
+    ctx.lineWidth = 2 * dpr;
     ctx.beginPath();
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(corner.x, corner.y);
-    ctx.lineTo(b.x, b.y);
+    for (const [a, b] of HAND_BONES) {
+      ctx.moveTo(pts[a].x, pts[a].y);
+      ctx.lineTo(pts[b].x, pts[b].y);
+    }
     ctx.stroke();
-  }
+
+    // Joints.
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = markColor;
+    for (const p of pts) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 3 * dpr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Bigger dots on the fingertips that are corners of the shape.
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 2 * dpr;
+    FINGERS.forEach((finger, f) => {
+      const isCorner =
+        fingerStates[h] && fingerStates[h][f] && SHAPE_FINGERS.includes(finger.name);
+      if (!isCorner) return;
+      const p = pts[finger.tip];
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 7 * dpr, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    });
+  });
 
   ctx.restore();
 }
@@ -485,8 +546,8 @@ function drawLabel(shape, t, dpr) {
 
   const width = Math.round((maxX - minX) / t.scale);
   const height = Math.round((maxY - minY) / t.scale);
-  const filter = FILTERS[filterIndex];
-  const filterText = filter.id === "none" ? "" : ` ${filter.name}`;
+  const filter = currentFilter();
+  const filterText = filter ? ` ${filter.name}` : "";
   const text = `${swapped ? "MONO" : "COLOR"}${filterText} ${width}x${height}`;
 
   const fontSize = 11 * dpr;
@@ -511,25 +572,6 @@ function drawLabel(shape, t, dpr) {
   ctx.restore();
 }
 
-// Small hollow rings on the fingertips, shown until a shape is formed.
-function drawMarkers(points, dpr) {
-  ctx.save();
-  ctx.strokeStyle = markColor;
-  ctx.lineWidth = 2 * dpr;
-  ctx.shadowColor = "rgba(0, 0, 0, 0.6)";
-  ctx.shadowBlur = 3 * dpr;
-
-  for (const handPoints of points) {
-    for (const p of handPoints) {
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, 6 * dpr, 0, Math.PI * 2);
-      ctx.stroke();
-    }
-  }
-
-  ctx.restore();
-}
-
 function drawOverlay(hands) {
   clearCanvas();
   window.latestShape = [];
@@ -550,51 +592,49 @@ function drawOverlay(hands) {
   const total = points.flat().length;
   const bothHandsActive = points.length === 2 && points.every((p) => p.length > 0);
 
-  if (!bothHandsActive || total < 3) {
-    drawMarkers(points, dpr);
-    return;
+  let shape = null;
+
+  if (bothHandsActive && total >= 3) {
+    shape = orderAroundCenter(points.flat());
+    window.latestShape = shape;
+
+    // Inside the shape we draw the video again, clipped to the shape.
+    // Normal: the video behind is gray, so this draws it in color.
+    // Swapped: the video behind is in color, so this draws it gray with extra
+    // contrast. A filter, if one is on, changes the picture inside.
+    // Faint scanlines go on top in every mode.
+    const filter = currentFilter();
+    const filterId = filter ? filter.id : "none";
+
+    ctx.save();
+    traceShape(shape);
+    ctx.clip();
+
+    if (filterId === "pixelate" || filterId === "glitch") {
+      drawFilteredVideo(filterId, shape, t);
+    } else {
+      const parts = [];
+      if (swapped) parts.push("grayscale(1) contrast(1.25)");
+      if (filterId === "invert") parts.push("invert(1)");
+      if (filterId === "invertSoft") parts.push("invert(1) hue-rotate(180deg)");
+      ctx.filter = parts.length ? parts.join(" ") : "none";
+      ctx.drawImage(video, t.offsetX, t.offsetY, t.vw * t.scale, t.vh * t.scale);
+      ctx.filter = "none";
+    }
+
+    if (scanlinePattern) {
+      ctx.fillStyle = scanlinePattern;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    ctx.restore();
+
+    drawOutline(shape, dpr);
   }
 
-  const shape = orderAroundCenter(points.flat());
-  window.latestShape = shape;
+  // The hand skeletons go on top of the shape.
+  drawHands(hands, t, dpr);
 
-  // Inside the shape we draw the video again, clipped to the shape.
-  // Normal: the video behind is gray, so this draws it in color.
-  // Swapped: the video behind is in color, so this draws it gray with extra
-  // contrast. A filter, if one is chosen, changes the picture inside.
-  // Faint scanlines go on top in every mode.
-  const filterId = FILTERS[filterIndex].id;
-
-  ctx.save();
-  traceShape(shape);
-  ctx.clip();
-
-  if (filterId === "none") {
-    if (swapped) ctx.filter = "grayscale(1) contrast(1.25)";
-    ctx.drawImage(video, t.offsetX, t.offsetY, t.vw * t.scale, t.vh * t.scale);
-    ctx.filter = "none";
-  } else {
-    drawFilteredVideo(filterId, shape, t);
-  }
-
-  if (scanlinePattern) {
-    ctx.fillStyle = scanlinePattern;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-  }
-  ctx.restore();
-
-  // Faint outline between the corners.
-  ctx.save();
-  traceShape(shape);
-  ctx.globalAlpha = 0.5;
-  ctx.strokeStyle = markColor;
-  ctx.lineWidth = 1.5 * dpr;
-  ctx.lineJoin = "round";
-  ctx.stroke();
-  ctx.restore();
-
-  drawBrackets(shape, dpr);
-  drawLabel(shape, t, dpr);
+  if (shape) drawLabel(shape, t, dpr);
 }
 
 new ResizeObserver(resizeCanvas).observe(stage);
@@ -758,8 +798,8 @@ swapBtn.addEventListener("click", () => {
 });
 
 filterBtn.addEventListener("click", () => {
-  applyFilter(filterIndex + 1, true);
-  saveSetting(FILTER_KEY, String(filterIndex));
+  setFiltersOn(!filtersOn, true);
+  saveSetting(FILTERS_ON_KEY, String(filtersOn));
 });
 
 colorInput.addEventListener("input", () => {
@@ -772,7 +812,7 @@ colorInput.addEventListener("input", () => {
 const savedColor = loadSetting(COLOR_KEY);
 applyColor(/^#[0-9a-f]{6}$/i.test(savedColor || "") ? savedColor : DEFAULT_COLOR);
 applySwap(loadSetting(SWAP_KEY) === "true");
-applyFilter(Number(loadSetting(FILTER_KEY)) || 0, false);
+setFiltersOn(loadSetting(FILTERS_ON_KEY) === "true", false);
 
 startBtn.disabled = false;
 console.log("Finger Shapes loaded");
