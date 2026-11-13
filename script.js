@@ -42,10 +42,10 @@ const HAND_BONES = [
   [0, 17],
 ];
 
-// Camcorder yellow. The person can change it with the color circle.
+// Camcorder yellow. The person can change it with the color control.
 const DEFAULT_COLOR = "#ffd21f";
 
-// Filters that can be applied inside the shape. When the filter button is
+// Filters that can be applied inside the shape. When the filter control is
 // on, one of these is picked at random and changes every few seconds.
 const FILTERS = [
   { id: "pixelate", name: "PIXELATE" },
@@ -74,14 +74,12 @@ const swapBtn = document.getElementById("swapBtn");
 const filterBtn = document.getElementById("filterBtn");
 const colorInput = document.getElementById("colorInput");
 const statusEl = document.getElementById("status");
-const toastEl = document.getElementById("toast");
 
 let markColor = DEFAULT_COLOR;
 let swapped = false;
 let filtersOn = false;
 let filterIndex = 0;
 let filterTimer = null;
-let toastTimer = null;
 
 let stream = null;
 let handLandmarker = null;
@@ -112,13 +110,6 @@ tinyCtx.imageSmoothingQuality = "high";
 function setStatus(message) {
   statusEl.textContent = message;
   statusEl.hidden = false;
-}
-
-function showToast(message) {
-  toastEl.textContent = message;
-  toastEl.classList.add("show");
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toastEl.classList.remove("show"), 1600);
 }
 
 function friendlyError(error) {
@@ -155,7 +146,6 @@ function saveSetting(key, value) {
 function applyColor(color) {
   markColor = color;
   colorInput.value = color;
-  document.documentElement.style.setProperty("--mark", color);
 }
 
 function applySwap(on) {
@@ -176,9 +166,9 @@ function pickRandomFilter() {
   window.latestFilter = FILTERS[filterIndex].id;
 }
 
-// The filter button is a one-click switch. On = a random filter that
+// The filter control is a one-click switch. On = a random filter that
 // changes every few seconds. Off = the normal look.
-function setFiltersOn(on, announce) {
+function setFiltersOn(on) {
   filtersOn = on;
   clearInterval(filterTimer);
   filterTimer = null;
@@ -192,9 +182,6 @@ function setFiltersOn(on, announce) {
   }
 
   filterBtn.setAttribute("aria-pressed", String(on));
-  filterBtn.setAttribute("aria-label", "Random filters");
-  filterBtn.title = `Random filters: ${on ? "ON" : "OFF"}`;
-  if (announce) showToast(on ? "FILTERS: RANDOM" : "FILTERS: OFF");
 }
 
 function currentFilter() {
@@ -798,7 +785,7 @@ swapBtn.addEventListener("click", () => {
 });
 
 filterBtn.addEventListener("click", () => {
-  setFiltersOn(!filtersOn, true);
+  setFiltersOn(!filtersOn);
   saveSetting(FILTERS_ON_KEY, String(filtersOn));
 });
 
@@ -812,7 +799,7 @@ colorInput.addEventListener("input", () => {
 const savedColor = loadSetting(COLOR_KEY);
 applyColor(/^#[0-9a-f]{6}$/i.test(savedColor || "") ? savedColor : DEFAULT_COLOR);
 applySwap(loadSetting(SWAP_KEY) === "true");
-setFiltersOn(loadSetting(FILTERS_ON_KEY) === "true", false);
+setFiltersOn(loadSetting(FILTERS_ON_KEY) === "true");
 
 startBtn.disabled = false;
 console.log("Finger Shapes loaded");
