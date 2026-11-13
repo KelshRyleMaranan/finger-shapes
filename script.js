@@ -32,6 +32,11 @@ const FINGERS = [
 // from ever counting, for example remove "ring" and "pinky" for fewer corners.
 const SHAPE_FINGERS = ["thumb", "index", "middle", "ring", "pinky"];
 
+// true  = the shape follows the order of your fingers, so it can fold over
+//         itself. Parts that overlap are merged, so the filter is applied once.
+// false = the old behavior: a clean outline that never folds.
+const ALLOW_FOLDS = true;
+
 // The lines of the hand skeleton, as pairs of the 21 MediaPipe points.
 const HAND_BONES = [
   [0, 1], [1, 2], [2, 3], [3, 4],
@@ -439,13 +444,78 @@ function clearCanvas() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 }
 
+// ---------- Shape sections ----------
+
 // Sorts points by angle around their center so the outline never twists.
+// Only used when ALLOW_FOLDS is false.
 function orderAroundCenter(points) {
   const cx = points.reduce((sum, p) => sum + p.x, 0) / points.length;
   const cy = points.reduce((sum, p) => sum + p.y, 0) / points.length;
   return points
     .slice()
     .sort((a, b) => Math.atan2(a.y - cy, a.x - cx) - Math.atan2(b.y - cy, b.x - cx));
+}
+
+function distance(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+// Joins the fingertips into one loop: hand 1's fingers in order (thumb to
+// pinky), then hand 2's. Hand 2's fingers are flipped if that makes the two
+// lines that join the hands shorter, so a normal pose doesn't twist.
+function buildRing(handA, handB) {
+  const lastA = handA[handA.length - 1];
+  const lastB = handB[handB.length - 1];
+  const straight = distance(lastA, handB[0]) + distance(lastB, handA[0]);
+  const flipped = distance(lastA, lastB) + distance(handB[0], handA[0]);
+  return flipped < straight
+    ? [...handA, ...handB.slice().reverse()]
+    : [...handA, ...handB];
+}
+
+// Cuts the ring into sections: one triangle for each pair of neighboring
+// fingertips, all meeting at the middle of the ring. When the ring folds
+// over itself, some triangles land on top of each other.
+// Every triangle is turned the same way round so the overlaps merge.
+function buildSections(ring) {
+  const center = {
+    x: ring.reduce((sum, p) => sum + p.x, 0) / ring.length,
+    y: ring.reduce((sum, p) => sum + p.y, 0) / ring.length,
+  };
+
+  const sections = [];
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i];
+    const b = ring[(i + 1) % ring.length];
+    const area = (a.x - center.x) * (b.y - center.y) - (a.y - center.y) * (b.x - center.x);
+    if (Math.abs(area) < 1) continue;
+    sections.push(area > 0 ? [center, a, b] : [center, b, a]);
+  }
+  return sections;
+}
+
+// The shape: its outline (the ring of fingertips) and its sections.
+function makeShape(points) {
+  if (!ALLOW_FOLDS) {
+    const ring = orderAroundCenter(points.flat());
+    return { ring, sections: [ring] };
+  }
+  const ring = buildRing(points[0], points[1]);
+  return { ring, sections: buildSections(ring) };
+}
+
+// All sections as one path. Because they are in one path, a spot covered by
+// two sections is still just one spot, so the filter is drawn on it once.
+function sectionsPath(sections) {
+  const path = new Path2D();
+  for (const section of sections) {
+    path.moveTo(section[0].x, section[0].y);
+    for (let i = 1; i < section.length; i++) {
+      path.lineTo(section[i].x, section[i].y);
+    }
+    path.closePath();
+  }
+  return path;
 }
 
 function traceShape(shape) {
@@ -562,12 +632,14 @@ function drawLabel(shape, t, dpr) {
 function drawOverlay(hands) {
   clearCanvas();
   window.latestShape = [];
+  window.latestSections = 0;
   if (!video.videoWidth) return;
 
   const t = getCoverTransform();
   const dpr = window.devicePixelRatio || 1;
 
-  // Only fingers that are out become corners.
+  // Only fingers that are out become corners, in finger order
+  // (thumb, index, middle, ring, pinky).
   const points = hands.map((hand, h) =>
     FINGERS.flatMap((finger, f) =>
       fingerStates[h][f] && SHAPE_FINGERS.includes(finger.name)
@@ -582,23 +654,27 @@ function drawOverlay(hands) {
   let shape = null;
 
   if (bothHandsActive && total >= 3) {
-    shape = orderAroundCenter(points.flat());
-    window.latestShape = shape;
+    shape = makeShape(points);
+
+    // Debug helpers for the Console. We remove them in a later commit.
+    window.latestShape = shape.ring;
+    window.latestSections = shape.sections.length;
 
     // Inside the shape we draw the video again, clipped to the shape.
     // Normal: the video behind is gray, so this draws it in color.
     // Swapped: the video behind is in color, so this draws it gray with extra
     // contrast. A filter, if one is on, changes the picture inside.
+    // The sections are merged into one area first, so a spot covered by
+    // two sections gets the filter once, never twice.
     // Faint scanlines go on top in every mode.
     const filter = currentFilter();
     const filterId = filter ? filter.id : "none";
 
     ctx.save();
-    traceShape(shape);
-    ctx.clip();
+    ctx.clip(sectionsPath(shape.sections), "nonzero");
 
     if (filterId === "pixelate" || filterId === "glitch") {
-      drawFilteredVideo(filterId, shape, t);
+      drawFilteredVideo(filterId, shape.ring, t);
     } else {
       const parts = [];
       if (swapped) parts.push("grayscale(1) contrast(1.25)");
@@ -615,13 +691,13 @@ function drawOverlay(hands) {
     }
     ctx.restore();
 
-    drawOutline(shape, dpr);
+    drawOutline(shape.ring, dpr);
   }
 
   // The hand skeletons go on top of the shape.
   drawHands(hands, t, dpr);
 
-  if (shape) drawLabel(shape, t, dpr);
+  if (shape) drawLabel(shape.ring, t, dpr);
 }
 
 new ResizeObserver(resizeCanvas).observe(stage);
@@ -714,6 +790,7 @@ function stopTracking() {
   fingerStates = [];
   window.latestHands = [];
   window.latestShape = [];
+  window.latestSections = 0;
   window.latestFingers = [];
   window.latestRatios = [];
   window.latestFps = 0;
